@@ -1,0 +1,16 @@
+[Unit]
+Description=ultimate-kiro bridge (Kiro -> Anthropic API for Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ultimate-kiro
+EnvironmentFile=/home/ubuntu/ultimate-kiro/kiro.env
+ExecStart=/home/ubuntu/ultimate-kiro/ultimate-kiro -port 3456 -log-file /home/ubuntu/ultimate-kiro/ultimate-kiro.log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

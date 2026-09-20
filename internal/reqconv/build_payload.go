@@ -1,0 +1,201 @@
+package reqconv
+
+import (
+	"github.com/d-kuro/kirocc/internal/advisor"
+	"github.com/d-kuro/kirocc/internal/anthropic"
+	"github.com/d-kuro/kirocc/internal/kiroproto"
+	"github.com/d-kuro/kirocc/internal/models"
+	"github.com/d-kuro/kirocc/internal/toolsearch"
+	"github.com/google/uuid"
+)
+
+// BuildOptions controls how an Anthropic request is mapped to a Kiro payload.
+type BuildOptions struct {
+	ProfileARN     string
+	ModelID        string
+	ConversationID string
+	// Effort is the resolved reasoning effort level. Empty means the model does
+	// not support effort or none was requested, in which case
+	// additionalModelRequestFields is omitted entirely.
+	Effort        string
+	ToolSearchCtx *toolsearch.Context
+	AdvisorCtx    *advisor.Context
+}
+
+// BuildPayload converts an Anthropic request into a Kiro API payload.
+func BuildPayload(req *anthropic.Request, options BuildOptions) (*kiroproto.Payload, *ToolNameMap, error) {
+	nameMap := NewToolNameMap()
+
+	// 1. Build system prompt and convert tools.
+	systemPrompt, toolEntries := buildSystemAndTools(req, options.ToolSearchCtx, options.AdvisorCtx, nameMap)
+
+	// envState is derived from the system prompt's <env> block (no host
+	// fallback) and only ever attached to the current message.
+	envState := ParseEnvState(systemPrompt)
+
+	// 2. Normalize and split messages.
+	// Keyed off the converted entries, not req.Tools: a request whose only tool
+	// is a server-side definition (advisor) has no callable tools upstream and
+	// must normalize as a tool-less conversation.
+	hasTools := len(toolEntries) > 0
+	msgs := Normalize(req.Messages, hasTools)
+	historyMsgs, lastMsg := splitMessages(msgs)
+
+	// Single-pass scan of the current message for tool_results and images.
+	// The tool_result IDs also identify which trailing assistant tool round is
+	// still in flight (for redacted reasoning replay in history).
+	toolResults, images := scanMessageContent(lastMsg.Content)
+	currentToolResultIDs := make([]string, 0, len(toolResults))
+	for _, tr := range toolResults {
+		currentToolResultIDs = append(currentToolResultIDs, tr.ToolUseID)
+	}
+
+	// 3. Build history and place system prompt.
+	history := buildHistory(historyMsgs, nameMap, currentToolResultIDs)
+	history, lastContent := placeSystemPrompt(systemPrompt, history, ExtractTextContent(lastMsg.Content))
+
+	// 4. Build currentMessage.
+	// Extract tool_use IDs from the preceding assistant message for reordering tool results.
+	var precedingToolUseIDs []string
+	if len(historyMsgs) > 0 {
+		precedingToolUseIDs = extractToolUseIDs(historyMsgs[len(historyMsgs)-1])
+	}
+	userInputMessage := buildCurrentMessage(lastContent, options.ModelID, toolEntries, envState, toolResults, images, precedingToolUseIDs)
+
+	convState := kiroproto.ConversationState{
+		ConversationID:  options.ConversationID,
+		ChatTriggerType: kiroproto.ChatTriggerTypeManual,
+		AgentTaskType:   kiroproto.AgentTaskTypeVibe,
+		CurrentMessage:  kiroproto.CurrentMessage{UserInputMessage: userInputMessage},
+	}
+	if len(history) > 0 {
+		convState.History = history
+	}
+	payload := &kiroproto.Payload{ConversationState: convState}
+	if options.ProfileARN != "" {
+		payload.ProfileARN = options.ProfileARN
+	}
+	if options.Effort != "" {
+		amrf := &kiroproto.AdditionalModelRequestFields{}
+		if models.IsReasoningModel(options.ModelID) {
+			amrf.Reasoning = &kiroproto.ReasoningConfig{Effort: options.Effort}
+		} else {
+			amrf.OutputConfig = &kiroproto.OutputConfig{Effort: options.Effort}
+		}
+		payload.AdditionalModelRequestFields = amrf
+	}
+	return payload, nameMap, nil
+}
+
+// buildSystemAndTools extracts the system prompt and converts tools.
+func buildSystemAndTools(req *anthropic.Request, tsCtx *toolsearch.Context, advisorCtx *advisor.Context, nameMap *ToolNameMap) (string, []kiroproto.ToolEntry) {
+	systemPrompt := ExtractSystemPrompt(req.System)
+
+	// Server-side tool definitions (tool search, advisor) are emulated in-proxy
+	// and must never reach Kiro as callable function tools. Filtering happens
+	// once so conversion and cache-point placement walk the same list.
+	tools := req.Tools
+	if tsCtx != nil {
+		tools = tsCtx.ActiveTools
+	}
+	callable := anthropic.CallableTools(tools)
+
+	var toolEntries []kiroproto.ToolEntry
+	if len(callable) > 0 {
+		toolEntries = ConvertTools(callable, nameMap)
+		toolEntries = ApplyToolCachePoints(callable, toolEntries)
+	}
+	if tsCtx != nil {
+		toolEntries = append(toolEntries, toolsearch.KiroToolSearchEntry())
+	}
+	if advisorCtx != nil {
+		toolEntries = append(toolEntries, advisorCtx.KiroToolEntry())
+	}
+	return systemPrompt, toolEntries
+}
+
+// splitMessages splits normalized messages into history messages and the last message.
+// If the last message is from the assistant, all messages go to history and a
+// synthetic "Continue" user message is returned.
+func splitMessages(msgs []anthropic.Message) (history []anthropic.Message, last anthropic.Message) {
+	if len(msgs) == 0 {
+		return nil, anthropic.Message{}
+	}
+	if msgs[len(msgs)-1].Role == "assistant" {
+		return msgs, anthropic.Message{
+			Role:    "user",
+			Content: anthropic.MessageContent{Text: syntheticContinue},
+		}
+	}
+	return msgs[:len(msgs)-1], msgs[len(msgs)-1]
+}
+
+// syntheticAck is the synthetic assistant acknowledgment that kiro-cli always
+// inserts after the system prompt in history. v2 captures confirm this is present
+// in every request.
+const syntheticAck = "I will fully incorporate this information when generating my responses, and explicitly acknowledge relevant parts of the summary when answering questions."
+
+// syntheticAckMessageID is a deterministic UUID for the synthetic ack, computed once since the input is constant.
+var syntheticAckMessageID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("synthetic-ack:"+syntheticAck)).String()
+
+// placeSystemPrompt inserts the system prompt as a dedicated history entry pair
+// (user message + synthetic assistant ack), matching the v2 kiro-cli structure.
+// v2 captures show this pair is present in every request, even the first one.
+// Returns a new history slice (original is not mutated) and the updated lastContent.
+func placeSystemPrompt(systemPrompt string, history []kiroproto.HistoryEntry, lastContent string) ([]kiroproto.HistoryEntry, string) {
+	if systemPrompt == "" {
+		return history, lastContent
+	}
+	// Always build the system prompt pair: user message + synthetic assistant ack.
+	systemPair := []kiroproto.HistoryEntry{
+		{UserInputMessage: &kiroproto.HistoryUserInputMessage{
+			Content: systemPrompt,
+			Origin:  kiroproto.OriginKiroCLI,
+		}},
+		{AssistantResponseMessage: &kiroproto.AssistantResponseMessage{
+			MessageID: syntheticAckMessageID,
+			Content:   syntheticAck,
+		}},
+	}
+	newHistory := make([]kiroproto.HistoryEntry, 0, len(systemPair)+len(history))
+	newHistory = append(newHistory, systemPair...)
+	newHistory = append(newHistory, history...)
+	return newHistory, lastContent
+}
+
+// buildCurrentMessage constructs the Kiro UserInputMessage from the last Anthropic message.
+func buildCurrentMessage(lastContent, modelID string, toolEntries []kiroproto.ToolEntry, envState *kiroproto.EnvState, toolResults []kiroproto.ToolResult, images []kiroproto.Image, precedingToolUseIDs []string) kiroproto.UserInputMessage {
+	msg := kiroproto.UserInputMessage{
+		Content: lastContent,
+		ModelID: modelID,
+		Origin:  kiroproto.OriginKiroCLI,
+	}
+
+	toolResults = ReorderToolResults(toolResults, precedingToolUseIDs)
+	if envState != nil || len(toolEntries) > 0 || len(toolResults) > 0 {
+		// Field order matches the wire format: envState before tools.
+		ctx := &kiroproto.UserInputMessageContext{}
+		if envState != nil {
+			ctx.EnvState = envState
+		}
+		if len(toolEntries) > 0 {
+			ctx.Tools = toolEntries
+		}
+		if len(toolResults) > 0 {
+			ctx.ToolResults = toolResults
+		}
+		msg.UserInputMessageContext = ctx
+	}
+
+	// Match the observed kiro-cli continuation shape:
+	// tool-result-only turns keep empty currentMessage.content instead of "Continue".
+	if msg.Content == "" && len(toolResults) == 0 {
+		msg.Content = syntheticContinue
+	}
+
+	if len(images) > 0 {
+		msg.Images = images
+	}
+
+	return msg
+}

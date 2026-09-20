@@ -1,0 +1,16 @@
+pre-commit:
+  parallel: true
+  commands:
+    golangci-lint:
+      glob: "*.go"
+      run: golangci-lint run --fix ./...
+    golangci-lint-fmt:
+      glob: "*.go"
+      run: golangci-lint fmt ./...
+    go-fix:
+      glob: "*.go"
+      run: go fix ./...
+    oxfmt:
+      glob: "*.md"
+      run: oxfmt --write {staged_files}
+      stage_fixed: true

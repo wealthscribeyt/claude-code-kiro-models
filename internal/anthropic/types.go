@@ -1,0 +1,368 @@
+package anthropic
+
+import (
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
+	"slices"
+)
+
+// Request represents an incoming Anthropic Messages API request.
+type Request struct {
+	Model         string          `json:"model"`
+	Messages      []Message       `json:"messages"`
+	System        SystemPrompt    `json:"system"`
+	Tools         []Tool          `json:"tools,omitempty"`
+	MaxTokens     int             `json:"max_tokens"`
+	StopSequences []string        `json:"stop_sequences,omitempty"`
+	Stream        bool            `json:"stream"`
+	Thinking      *ThinkingConfig `json:"thinking,omitempty"`
+	OutputConfig  *OutputConfig   `json:"output_config,omitempty"`
+}
+
+// OutputConfig represents the output_config field in the Anthropic API.
+type OutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+// ThinkingConfig represents the thinking configuration in the Anthropic API.
+type ThinkingConfig struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitzero"`
+}
+
+// Thinking type constants.
+const (
+	ThinkingTypeEnabled  = "enabled"
+	ThinkingTypeAdaptive = "adaptive"
+	ThinkingTypeDisabled = "disabled"
+)
+
+// IsThinkingEnabled reports whether extended thinking is enabled in the request.
+// Anthropic API supports type "enabled" and "adaptive".
+func (r *Request) IsThinkingEnabled() bool {
+	if r.Thinking == nil {
+		return false
+	}
+	return r.Thinking.Type == ThinkingTypeEnabled || r.Thinking.Type == ThinkingTypeAdaptive
+}
+
+// IsThinkingDisabled reports whether the request explicitly opts out of
+// reasoning via thinking.type "disabled". Distinguishing disabled from absent
+// matters for models where the opt-out must be forwarded (GPT 5.6 sends
+// reasoning.effort "none" for disabled, omits the field entirely for absent).
+func (r *Request) IsThinkingDisabled() bool {
+	return r.Thinking != nil && r.Thinking.Type == ThinkingTypeDisabled
+}
+
+// Effort returns the effort level from output_config.effort.
+// Returns empty string if unset.
+func (r *Request) Effort() string {
+	if r.OutputConfig != nil {
+		return r.OutputConfig.Effort
+	}
+	return ""
+}
+
+// Message represents a single message in the conversation.
+type Message struct {
+	Role    string         `json:"role"`
+	Content MessageContent `json:"content"`
+}
+
+// MessageContent is a union type: either a plain string or []ContentBlock.
+type MessageContent struct {
+	Text   string         // set when content is a plain string
+	Blocks []ContentBlock // set when content is an array of content blocks
+}
+
+// IsString reports whether the content is a plain string.
+func (mc MessageContent) IsString() bool {
+	return mc.Blocks == nil
+}
+
+// String returns the text representation. For blocks, joins text blocks with space.
+func (mc MessageContent) String() string {
+	if mc.IsString() {
+		return mc.Text
+	}
+	var s string
+	for _, b := range mc.Blocks {
+		if b.Type == BlockTypeText {
+			if s != "" {
+				s += " "
+			}
+			s += b.Text
+		}
+	}
+	return s
+}
+
+func (mc MessageContent) MarshalJSONTo(enc *jsontext.Encoder) error {
+	if mc.IsString() {
+		return json.MarshalEncode(enc, mc.Text)
+	}
+	return json.MarshalEncode(enc, mc.Blocks)
+}
+
+func (mc *MessageContent) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	switch dec.PeekKind() {
+	case '"':
+		return json.UnmarshalDecode(dec, &mc.Text)
+	case '[':
+		return json.UnmarshalDecode(dec, &mc.Blocks)
+	case '{':
+		// tool_search_tool_result content is an object — store as single-element Blocks.
+		var block ContentBlock
+		if err := json.UnmarshalDecode(dec, &block); err != nil {
+			return err
+		}
+		mc.Blocks = []ContentBlock{block}
+		return nil
+	default:
+		return fmt.Errorf("unexpected content type: %v", dec.PeekKind())
+	}
+}
+
+// ContentBlock represents a single content block within a message.
+type ContentBlock struct {
+	Type string `json:"type"`
+
+	// text block
+	Text string `json:"text,omitempty"`
+
+	// thinking block
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+
+	// redacted_thinking block: opaque encrypted reasoning blob (base64)
+	Data string `json:"data,omitempty"`
+
+	// tool_use / server_tool_use block (assistant)
+	ID    string         `json:"id,omitempty"`
+	Name  string         `json:"name,omitempty"`
+	Input map[string]any `json:"input,omitempty"`
+
+	// tool_result block (user)
+	ToolUseID string         `json:"tool_use_id,omitempty"`
+	Content   MessageContent `json:"content"`
+	IsError   bool           `json:"is_error,omitzero"`
+
+	// image block
+	Source *ImageSource `json:"source,omitempty"`
+
+	// tool_reference block
+	ToolName string `json:"tool_name,omitempty"`
+
+	// tool_search_tool_search_result (nested inside tool_search_tool_result content)
+	ToolReferences []ContentBlock `json:"tool_references,omitempty"`
+
+	// advisor_result / advisor_redacted_result / advisor_tool_result_error
+	// (nested inside advisor_tool_result content). EncryptedContent is
+	// Anthropic-key encrypted and can only be echoed, never produced.
+	EncryptedContent string `json:"encrypted_content,omitempty"`
+	StopReason       string `json:"stop_reason,omitempty"`
+	ErrorCode        string `json:"error_code,omitempty"`
+
+	// cache_control (prompt caching)
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
+}
+
+// IsToolUse reports whether this block is a tool_use or server_tool_use block.
+func (b ContentBlock) IsToolUse() bool {
+	return b.Type == BlockTypeToolUse || b.Type == BlockTypeServerToolUse
+}
+
+// IsToolResult reports whether this block is a tool_result or tool_search_tool_result block.
+func (b ContentBlock) IsToolResult() bool {
+	return b.Type == BlockTypeToolResult || b.Type == BlockTypeToolSearchToolResult
+}
+
+// IsServerToolResult reports whether this block is a server-side tool result
+// that appears inside an assistant response (paired with a server_tool_use in
+// the same message), as opposed to a user-authored tool_result.
+func (b ContentBlock) IsServerToolResult() bool {
+	return b.Type == BlockTypeToolSearchToolResult || b.Type == BlockTypeAdvisorToolResult
+}
+
+// ImageSource represents the source of an image content block.
+type ImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+// CacheControl represents cache control settings for prompt caching.
+type CacheControl struct {
+	Type string `json:"type"`
+}
+
+// Tool Search Tool type constants.
+const (
+	ToolTypeSearchRegex = "tool_search_tool_regex_20251119"
+	ToolTypeSearchBM25  = "tool_search_tool_bm25_20251119"
+)
+
+// ToolTypeAdvisor is the advisor server-side tool definition type.
+const ToolTypeAdvisor = "advisor_20260301"
+
+// AdvisorToolName is the name the advisor tool is always registered under.
+const AdvisorToolName = "advisor"
+
+// Advisor tool result error codes.
+const (
+	AdvisorErrorMaxUsesExceeded       = "max_uses_exceeded"
+	AdvisorErrorPromptTooLong         = "prompt_too_long"
+	AdvisorErrorTooManyRequests       = "too_many_requests"
+	AdvisorErrorOverloaded            = "overloaded"
+	AdvisorErrorUnavailable           = "unavailable"
+	AdvisorErrorExecutionTimeExceeded = "execution_time_exceeded"
+	AdvisorErrorModelNotFound         = "model_not_found"
+)
+
+// Content block type constants.
+const (
+	BlockTypeText                   = "text"
+	BlockTypeThinking               = "thinking"
+	BlockTypeImage                  = "image"
+	BlockTypeToolUse                = "tool_use"
+	BlockTypeServerToolUse          = "server_tool_use"
+	BlockTypeToolResult             = "tool_result"
+	BlockTypeToolSearchToolResult   = "tool_search_tool_result"
+	BlockTypeToolReference          = "tool_reference"
+	BlockTypeToolSearchSearchResult = "tool_search_tool_search_result"
+	BlockTypeToolSearchResultError  = "tool_search_tool_result_error"
+	BlockTypeRedactedThinking       = "redacted_thinking"
+	BlockTypeAdvisorToolResult      = "advisor_tool_result"
+	BlockTypeAdvisorResult          = "advisor_result"
+	BlockTypeAdvisorRedactedResult  = "advisor_redacted_result"
+	BlockTypeAdvisorResultError     = "advisor_tool_result_error"
+)
+
+// Tool represents a tool definition in the Anthropic API.
+type Tool struct {
+	Type         string         `json:"type,omitempty"`
+	Name         string         `json:"name,omitempty"`
+	Description  string         `json:"description,omitempty"`
+	InputSchema  map[string]any `json:"input_schema,omitempty"`
+	CacheControl *CacheControl  `json:"cache_control,omitempty"`
+	DeferLoading bool           `json:"defer_loading,omitzero"`
+
+	// advisor_20260301 fields. Model names the advisor model the conversation
+	// is escalated to; MaxUses caps consultations per request; Caching is
+	// accepted and validated but only honored on a best-effort basis.
+	Model     string          `json:"model,omitempty"`
+	MaxUses   int             `json:"max_uses,omitzero"`
+	MaxTokens int             `json:"max_tokens,omitzero"`
+	Caching   *AdvisorCaching `json:"caching,omitempty"`
+}
+
+// AdvisorCaching is the advisor tool's caching configuration.
+type AdvisorCaching struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
+}
+
+// Advisor caching TTL values accepted by the Anthropic API.
+const (
+	AdvisorCacheTTL5m = "5m"
+	AdvisorCacheTTL1h = "1h"
+)
+
+// IsValid reports whether the caching config is one the API would accept.
+func (c *AdvisorCaching) IsValid() bool {
+	if c == nil {
+		return true
+	}
+	if c.Type != "ephemeral" {
+		return false
+	}
+	return c.TTL == "" || c.TTL == AdvisorCacheTTL5m || c.TTL == AdvisorCacheTTL1h
+}
+
+// IsToolSearchTool reports whether this tool is a tool search tool definition.
+func (t Tool) IsToolSearchTool() bool {
+	return t.Type == ToolTypeSearchRegex || t.Type == ToolTypeSearchBM25
+}
+
+// IsAdvisorTool reports whether this tool is an advisor tool definition.
+func (t Tool) IsAdvisorTool() bool {
+	return t.Type == ToolTypeAdvisor
+}
+
+// IsServerTool reports whether this tool is a server-side tool that kirocc
+// emulates in-proxy and must never forward to the Kiro backend as a callable
+// function tool.
+func (t Tool) IsServerTool() bool {
+	return t.IsToolSearchTool() || t.IsAdvisorTool()
+}
+
+// CallableTools returns the tools that should be forwarded to the Kiro backend
+// as callable function tools, filtering out server-side tool definitions that
+// kirocc emulates itself. The result must be used for both tool conversion and
+// cache-point placement, which walk the tool list and the converted entries in
+// lockstep.
+func CallableTools(tools []Tool) []Tool {
+	if !slices.ContainsFunc(tools, Tool.IsServerTool) {
+		return tools
+	}
+	out := make([]Tool, 0, len(tools)-1)
+	for _, t := range tools {
+		if !t.IsServerTool() {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// FindAdvisorTool returns the advisor tool definition, if present.
+func FindAdvisorTool(tools []Tool) *Tool {
+	for i := range tools {
+		if tools[i].IsAdvisorTool() {
+			return &tools[i]
+		}
+	}
+	return nil
+}
+
+// SystemPrompt is a union type: either a plain string or []SystemBlock.
+type SystemPrompt struct {
+	Text   string        // set when system is a plain string
+	Blocks []SystemBlock // set when system is an array
+}
+
+// IsEmpty reports whether the system prompt is empty.
+func (sp SystemPrompt) IsEmpty() bool {
+	return sp.Text == "" && len(sp.Blocks) == 0
+}
+
+func (sp SystemPrompt) MarshalJSONTo(enc *jsontext.Encoder) error {
+	if len(sp.Blocks) > 0 {
+		return json.MarshalEncode(enc, sp.Blocks)
+	}
+	if sp.Text != "" {
+		return json.MarshalEncode(enc, sp.Text)
+	}
+	return enc.WriteToken(jsontext.Null)
+}
+
+func (sp *SystemPrompt) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	switch dec.PeekKind() {
+	case 'n':
+		_, err := dec.ReadToken()
+		return err
+	case '"':
+		return json.UnmarshalDecode(dec, &sp.Text)
+	case '[':
+		return json.UnmarshalDecode(dec, &sp.Blocks)
+	default:
+		return fmt.Errorf("unexpected system type: %v", dec.PeekKind())
+	}
+}
+
+// SystemBlock represents a single block in an array-form system prompt.
+type SystemBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
+}

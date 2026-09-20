@@ -1,0 +1,177 @@
+package respconv
+
+import (
+	"encoding/json/v2"
+
+	"github.com/d-kuro/kirocc/internal/anthropic"
+	"github.com/d-kuro/kirocc/internal/kiroproto"
+	"github.com/google/uuid"
+)
+
+// NonStreamingStats holds token usage and context info from a non-streaming response.
+type NonStreamingStats struct {
+	// Token usage.
+	InputTokens  int
+	OutputTokens int
+	// Context usage from Kiro.
+	HasContextUsage        bool
+	ContextUsagePercentage float64
+	// Credit usage from meteringEvent.
+	HasCredits bool
+	Credits    float64
+}
+
+// NonStreamingAccumulator wraps responseAccumulator for incremental non-streaming processing.
+type NonStreamingAccumulator struct {
+	acc responseAccumulator
+}
+
+// NewNonStreamingAccumulator creates a new accumulator for non-streaming responses.
+func NewNonStreamingAccumulator(contextWindowSize int, stopSequences []string, maxTokens int, preCountedInputTokens int) *NonStreamingAccumulator {
+	a := &NonStreamingAccumulator{}
+	a.acc = newAccumulator(contextWindowSize, stopSequences, maxTokens, preCountedInputTokens)
+	return a
+}
+
+// ProcessEvent processes a single event and returns the delta.
+func (n *NonStreamingAccumulator) ProcessEvent(e kiroproto.Event) EventDelta {
+	return n.acc.ProcessEvent(e)
+}
+
+// HasToolUse reports whether a client-visible tool call was recorded.
+// Dropped server-tool calls are excluded.
+func (n *NonStreamingAccumulator) HasToolUse() bool { return n.acc.HasToolUse }
+
+// SetDropToolNames sets the tool names to filter from accumulator recording.
+func (n *NonStreamingAccumulator) SetDropToolNames(names ...string) {
+	n.acc.setDropToolNames(names)
+}
+
+// SetToolNameMap sets the short→original tool name map for response remapping.
+func (n *NonStreamingAccumulator) SetToolNameMap(m map[string]string) {
+	n.acc.toolNameMap = m
+}
+
+// BuildResponse builds the final Anthropic response from accumulated events.
+func (n *NonStreamingAccumulator) BuildResponse(model string) (map[string]any, NonStreamingStats) {
+	return buildResponseFromAcc(&n.acc, model)
+}
+
+// FinalizeText finalizes the stream and returns the accumulated visible text,
+// resolved stop reason, and token stats without building the client response
+// map. Call exactly once, instead of BuildResponse. Used for internal
+// subcalls (advisor) where only the text matters.
+func (n *NonStreamingAccumulator) FinalizeText() (text, stopReason string, stats NonStreamingStats) {
+	_, _, res := finalizeResult(&n.acc)
+	return n.acc.TextBuf.String(), res.StopReason, statsFromAcc(&n.acc, res)
+}
+
+// statsFromAcc assembles the caller-visible stats from a finalized accumulator.
+// Single-sourced so a new stat cannot be reported by one path and silently
+// zeroed by the other.
+func statsFromAcc(acc *responseAccumulator, res finalResult) NonStreamingStats {
+	return NonStreamingStats{
+		InputTokens:            res.InputTokens,
+		OutputTokens:           res.OutputTokens,
+		HasContextUsage:        acc.HasContextUsage,
+		ContextUsagePercentage: acc.ContextUsagePercentage,
+		HasCredits:             acc.HasCredits,
+		Credits:                acc.Credits,
+	}
+}
+
+// IsEmptyVisibleEndTurn reports whether the response had thinking but no visible text or tool use.
+func (n *NonStreamingAccumulator) IsEmptyVisibleEndTurn() bool {
+	return n.acc.IsEmptyVisibleEndTurn()
+}
+
+// ThinkingLen returns the length of accumulated thinking content.
+func (n *NonStreamingAccumulator) ThinkingLen() int {
+	return n.acc.ThinkingBuf.Len()
+}
+
+// RedactedContents returns the redacted reasoning blobs accumulated so far.
+func (n *NonStreamingAccumulator) RedactedContents() []string {
+	return n.acc.RedactedContents
+}
+
+// Credits returns the per-response credit consumption from meteringEvent.
+// The bool is false if no meteringEvent was received.
+func (n *NonStreamingAccumulator) Credits() (float64, bool) {
+	return n.acc.Credits, n.acc.HasCredits
+}
+
+// BuildNonStreamingResponse builds a complete Anthropic response from buffered events.
+func BuildNonStreamingResponse(events []kiroproto.Event, model string, contextWindowSize int, stopSequences []string, maxTokens int, preCountedInputTokens int) (map[string]any, NonStreamingStats) {
+	a := NewNonStreamingAccumulator(contextWindowSize, stopSequences, maxTokens, preCountedInputTokens)
+	for _, e := range events {
+		a.ProcessEvent(e)
+	}
+	return a.BuildResponse(model)
+}
+
+// buildResponseFromAcc builds the Anthropic response from a responseAccumulator.
+func buildResponseFromAcc(acc *responseAccumulator, model string) (map[string]any, NonStreamingStats) {
+	_, _, res := finalizeResult(acc)
+
+	// Deduplicate tool calls.
+	toolCalls := DeduplicateToolCalls(acc.ToolCalls)
+
+	// Build content array: redacted_thinking → thinking → text → tool_use.
+	// Reasoning leads, as it does on the Anthropic wire. A blob placed after
+	// the text makes Claude Code's final-result extraction drop the answer —
+	// it keeps only text following the last thinking block — which is what
+	// empties `claude -p` against Kiro's `auto`. One block per blob, never
+	// concatenated: joining base64 blobs would corrupt them.
+	content := []any{}
+	for _, rc := range acc.RedactedContents {
+		content = append(content, map[string]any{
+			"type": anthropic.BlockTypeRedactedThinking,
+			"data": rc,
+		})
+	}
+	if acc.ThinkingBuf.Len() > 0 {
+		block := map[string]any{
+			"type":     anthropic.BlockTypeThinking,
+			"thinking": acc.ThinkingBuf.String(),
+		}
+		if acc.Signature != "" {
+			block["signature"] = acc.Signature
+		}
+		content = append(content, block)
+	}
+	if acc.TextBuf.Len() > 0 {
+		content = append(content, map[string]any{
+			"type": anthropic.BlockTypeText,
+			"text": acc.TextBuf.String(),
+		})
+	}
+	// When ThinkingBuf has content but no text or tool use, we intentionally
+	// skip injecting an empty text block. The caller detects this via
+	// IsEmptyVisibleEndTurn and retries the request instead.
+	for _, tc := range toolCalls {
+		var input any
+		if err := json.Unmarshal([]byte(tc.Input), &input); err != nil {
+			input = map[string]any{}
+		}
+		content = append(content, map[string]any{
+			"type":  anthropic.BlockTypeToolUse,
+			"id":    tc.ID,
+			"name":  tc.Name,
+			"input": input,
+		})
+	}
+
+	stats := statsFromAcc(acc, res)
+
+	return map[string]any{
+		"id":            "msg_" + uuid.New().String()[:24],
+		"type":          "message",
+		"role":          "assistant",
+		"content":       content,
+		"model":         model,
+		"stop_reason":   res.StopReason,
+		"stop_sequence": res.StopSequence,
+		"usage":         res.Usage,
+	}, stats
+}

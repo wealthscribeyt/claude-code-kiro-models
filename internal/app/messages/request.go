@@ -1,0 +1,107 @@
+package messages
+
+import (
+	"bytes"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+
+	"github.com/d-kuro/kirocc/internal/anthropic"
+	"github.com/d-kuro/kirocc/internal/httpx"
+	"github.com/d-kuro/kirocc/internal/models"
+	"github.com/d-kuro/kirocc/internal/reqconv"
+	"github.com/d-kuro/kirocc/internal/tokencount"
+)
+
+// HandleCountTokens serves POST /v1/messages/count_tokens.
+func (s *Service) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
+	req, err := parseAndValidateRequest(r.Context(), w, r, s.maxRequestBody)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, errTypeInvalidRequest, err.Error())
+		return
+	}
+
+	profileARN := ""
+	if creds, err := s.auth.GetToken(r.Context()); err == nil {
+		profileARN = creds.ProfileARN
+	} else {
+		slog.DebugContext(r.Context(), "count_tokens proceeding without credentials", "err", err)
+	}
+
+	kiroModel, thinking, _, _ := models.Resolve(req.Model, anthropic.HasContext1MBeta(r.Header))
+	if req.IsThinkingEnabled() {
+		thinking = true
+	}
+
+	ccSessionID := r.Header.Get(headerCCSessionID)
+
+	// Mirror the live send path so token counts include effort (envState is
+	// derived inside BuildPayload from the system prompt) and the same tool
+	// entries: server-side tool definitions are filtered and replaced by their
+	// synthetic Kiro tools exactly as the live /v1/messages payload does.
+	effort := resolveEffort(r.Context(), kiroModel, req, thinking)
+	tsCtx, advCtx := newServerToolContexts(req)
+
+	payload, _, err := reqconv.BuildPayload(req, reqconv.BuildOptions{
+		ProfileARN:     profileARN,
+		ModelID:        kiroModel,
+		ConversationID: ccSessionID,
+		Effort:         effort,
+		ToolSearchCtx:  tsCtx,
+		AdvisorCtx:     advCtx,
+	})
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, errTypeInvalidRequest, err.Error())
+		return
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, errTypeAPI, "failed to serialize payload")
+		return
+	}
+
+	n, err := tokencount.CountBytes(data)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, errTypeAPI, "token counting unavailable")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.MarshalWrite(w, map[string]int{"input_tokens": n}); err != nil {
+		slog.ErrorContext(r.Context(), "write count_tokens response failed", "err", err)
+		return
+	}
+	_, _ = w.Write([]byte("\n"))
+}
+
+// parseAndValidateRequest decodes and validates an Anthropic request from the
+// HTTP body. maxBody caps the body in bytes; 0 disables the cap.
+func parseAndValidateRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, maxBody int64) (*anthropic.Request, error) {
+	if maxBody > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	}
+	var req anthropic.Request
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, fmt.Errorf("invalid request: %w", err)
+		}
+		slog.DebugContext(ctx, "client request body", "request_body", jsontext.Value(raw))
+		if err := json.UnmarshalDecode(jsontext.NewDecoder(bytes.NewReader(raw)), &req); err != nil {
+			return nil, fmt.Errorf("invalid request: %w", err)
+		}
+	} else {
+		if err := json.UnmarshalRead(r.Body, &req); err != nil {
+			return nil, fmt.Errorf("invalid request: %w", err)
+		}
+	}
+	if len(req.Messages) == 0 {
+		return nil, fmt.Errorf("messages must not be empty")
+	}
+	return &req, nil
+}
