@@ -4,6 +4,17 @@ A local proxy server that relays Anthropic Messages API-compatible requests to t
 
 Just set `ANTHROPIC_BASE_URL` from any Anthropic API client (e.g., Claude Code) to use Claude models via Kiro.
 
+## Ultimate build — Claude Code at max quality
+
+![How it works](docs/assets/architecture.svg)
+
+![31 live models + effort proof](docs/assets/models-and-proof.svg)
+
+- **Max effort by default**, budget→tier mapping, `KIROCC_FORCE_EFFORT` override
+- **Native thinking streams**, `[1m]` 1M routing, full MCP schemas, `$ref` dereferencing
+- **Verified live:** 31/31 models route, 46/46 model×effort matrix green, GPT honors all 5 tiers
+- See [FORK.md](FORK.md) for build notes and the full proof log
+
 ## Features
 
 - **Anthropic Messages API compatible** — Supports `/v1/messages` (streaming / non-streaming), `/v1/messages/count_tokens`, and `/v1/models`
