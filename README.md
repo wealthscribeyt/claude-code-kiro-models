@@ -1,8 +1,27 @@
-# kirocc
+# Claude Code + Kiro Models
 
-A local proxy server that relays Anthropic Messages API-compatible requests to the Kiro (Amazon Q) backend using Kiro CLI credentials.
+[![Release](https://img.shields.io/github/v/release/wealthscribeyt/claude-code-kiro-models)](https://github.com/wealthscribeyt/claude-code-kiro-models/releases)
+[![License](https://img.shields.io/github/license/wealthscribeyt/claude-code-kiro-models)](LICENSE)
+[![Go](https://img.shields.io/github/go-mod-go-version/wealthscribeyt/claude-code-kiro-models)](go.mod)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)](https://github.com/wealthscribeyt/claude-code-kiro-models/releases)
+
+Run **Claude Code on Kiro models** — 31 models, native thinking, max effort, 1M context — with subscription-identical behavior (`/model`, `/effort`, `ultrathink`, `ultracode`, skills, MCP, subagents).
+
+A local proxy server that relays Anthropic Messages API-compatible requests to the Kiro backend using Kiro CLI credentials.
 
 Just set `ANTHROPIC_BASE_URL` from any Anthropic API client (e.g., Claude Code) to use Claude models via Kiro.
+
+## 60-second quickstart (Windows)
+
+```powershell
+# 1. terminal 1 — start the bridge (keep open)
+.\bin\ultimate-kiro.exe -port 3456
+# 2. terminal 2 — launch Claude Code on Kiro
+$env:ANTHROPIC_BASE_URL="http://127.0.0.1:3456"
+$env:ANTHROPIC_AUTH_TOKEN="x"
+$env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
+claude --model claude-opus-5[1m]   # /model switches mid-session
+```
 
 ## Ultimate build — Claude Code at max quality
 
