@@ -54,6 +54,7 @@ type AuthManager struct {
 	db               *sql.DB // non-nil only in tests via newAuthManagerWithDB
 	apiKey           string  // when set, short-circuits both the DB and refresh
 	apiKeyRegion     string
+	forceRefresh     bool // next refreshCredentials call must hit the refresh endpoint
 	httpClient       *http.Client
 	mu               sync.Mutex
 	cached           *Credentials
@@ -155,14 +156,43 @@ func (m *AuthManager) InvalidateCache() {
 	m.mu.Unlock()
 }
 
+// ForceRefresh returns credentials after an actual refresh, bypassing the
+// validity checks GetToken applies. A 403 means the upstream rejected the
+// token even though its ExpiresAt may still be hours away (server-side
+// revocation, permission change, clock skew) — a plain GetToken would just
+// re-serve the same rejected token from the DB and burn every retry attempt,
+// so the 403 retry path must force the refresh endpoint to be called.
+func (m *AuthManager) ForceRefresh(ctx context.Context) (*Credentials, error) {
+	// An API key cannot be refreshed; a rejected key is terminal and the
+	// retry surface should see the 403 rather than a refresh error.
+	if m.UsesAPIKey() {
+		return m.GetToken(ctx)
+	}
+	m.mu.Lock()
+	m.forceRefresh = true
+	// Drop the cached token: a 403 means the cached copy is rejected
+	// upstream even though it may still be time-valid, and GetToken would
+	// otherwise re-serve it from cache without ever reaching refreshCredentials.
+	m.cached = nil
+	m.mu.Unlock()
+	return m.GetToken(ctx)
+}
+
 // refreshCredentials re-reads from DB and refreshes if needed. Called under singleflight.
 func (m *AuthManager) refreshCredentials(ctx context.Context) (*Credentials, error) {
-	// Re-check cache under lock — another goroutine may have refreshed while we waited.
+	// Consume the force-refresh flag (set by ForceRefresh after an upstream
+	// 403) before any validity check: both the cached copy and the DB copy of
+	// a rejected-but-time-valid token must be bypassed, not re-served.
 	m.mu.Lock()
-	if m.cached != nil && isTokenValid(m.cached.ExpiresAt) {
-		c := *m.cached
-		m.mu.Unlock()
-		return &c, nil
+	forced := m.forceRefresh
+	m.forceRefresh = false
+	if !forced {
+		// Re-check cache under lock — another goroutine may have refreshed while we waited.
+		if m.cached != nil && isTokenValid(m.cached.ExpiresAt) {
+			c := *m.cached
+			m.mu.Unlock()
+			return &c, nil
+		}
 	}
 	m.mu.Unlock()
 
@@ -171,7 +201,9 @@ func (m *AuthManager) refreshCredentials(ctx context.Context) (*Credentials, err
 		return nil, err
 	}
 
-	if isTokenValid(creds.ExpiresAt) {
+	if forced {
+		slog.Info("forcing token refresh (token rejected upstream)", "auth_type", creds.AuthType, "region", creds.Region)
+	} else if isTokenValid(creds.ExpiresAt) {
 		slog.Info("credentials loaded", "auth_type", creds.AuthType, "region", creds.Region)
 		m.mu.Lock()
 		m.cached = creds

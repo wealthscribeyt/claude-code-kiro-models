@@ -182,6 +182,9 @@ Command-line options can be overridden with environment variables.
 | `KIROCC_LOG_CONSOLE`        | `-log-console`        |
 | `KIROCC_OTEL`               | `-otel`               |
 | `KIROCC_OTEL_BODY_LIMIT`    | `-otel-body-limit`    |
+| `KIROCC_MAX_REQUEST_BODY`   | `-max-request-body`   |
+| `KIROCC_FORCE_EFFORT`       | _(ultimate build)_ pins every request to one tier (`low`/`medium`/`high`/`xhigh`/`max`); e.g. an eco instance on `:3457` with `KIROCC_FORCE_EFFORT=low` |
+| `KIROCC_HIDE_MODELS`        | _(ultimate build)_ comma-separated substrings hidden from `/v1/models` (e.g. `fable` for SKUs the account cannot use) |
 
 `KIRO_API_KEY` and `KIRO_API_REGION` intentionally keep Kiro's own names rather than the `KIROCC_` prefix, so a machine already configured for headless kiro-cli needs no kirocc-specific setup.
 

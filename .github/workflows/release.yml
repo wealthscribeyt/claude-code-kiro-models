@@ -36,18 +36,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Generate token for homebrew-tap
-        id: generate-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: d-kuro
-          repositories: homebrew-tap
+      # Ultimate-proxy fork: no homebrew-tap token step — the upstream
+      # workflow published to d-kuro/homebrew-tap using secrets this fork
+      # does not have; keep the release local to this repository.
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_TOKEN: ${{ steps.generate-token.outputs.token }}

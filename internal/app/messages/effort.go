@@ -13,8 +13,12 @@ import (
 )
 
 // formatContextWindow renders a context window size as a human label like
-// "200k" or "1M" for log output.
+// "200k" or "1M" for log output. Zero means the window is decided upstream
+// (the auto SKU), not that the model has no window.
 func formatContextWindow(size int) string {
+	if size <= 0 {
+		return "auto"
+	}
 	if size >= 1_000_000 {
 		return fmt.Sprintf("%dM", size/1_000_000)
 	}
@@ -82,8 +86,11 @@ func resolveEffort(ctx context.Context, kiroModel string, req *anthropic.Request
 	// Ultimate-proxy addition: KIROCC_FORCE_EFFORT pins every request to one
 	// native tier (e.g. an eco bridge with KIROCC_FORCE_EFFORT=low). Wins over
 	// explicit effort, budget mapping and defaults; validated/clamped against
-	// the model's enum, invalid values fall through with a warning.
-	if forced := strings.ToLower(strings.TrimSpace(os.Getenv("KIROCC_FORCE_EFFORT"))); forced != "" {
+	// the model's enum, invalid values fall through with a warning. An
+	// explicit thinking opt-out (thinking.type "disabled") still wins: forcing
+	// effort on a request that asked for no reasoning would re-enable it,
+	// spending credits the eco pin exists to save.
+	if forced := strings.ToLower(strings.TrimSpace(os.Getenv("KIROCC_FORCE_EFFORT"))); forced != "" && !req.IsThinkingDisabled() {
 		if resolved := models.ResolveEffort(kiroModel, forced); resolved != "" {
 			slog.InfoContext(ctx, "effort forced via KIROCC_FORCE_EFFORT",
 				"trace_id", short, "model", kiroModel, "effort", resolved)

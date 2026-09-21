@@ -44,21 +44,8 @@ changelog:
       - "Merge pull request"
       - "Merge branch"
 
-homebrew_casks:
-  - repository:
-      owner: d-kuro
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    directory: Casks
-    homepage: "https://github.com/d-kuro/kirocc"
-    description: "Local proxy server that relays Anthropic Messages API requests to the Kiro backend"
-    license: "Apache-2.0"
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kirocc"]
-          end
+# Ultimate-proxy fork: no homebrew_casks — the upstream config published to
+# d-kuro/homebrew-tap, which this fork cannot (and should not) write to.
 
 release:
   draft: false

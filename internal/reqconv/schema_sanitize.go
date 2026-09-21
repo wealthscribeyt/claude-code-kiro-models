@@ -146,7 +146,11 @@ func SanitizeJSONSchema(schema map[string]any) map[string]any {
 		}
 		switch key {
 		case "const":
-			result["enum"] = []any{value}
+			// Deterministic when the schema carries both const and enum:
+			// the explicit enum wins regardless of map iteration order.
+			if _, hasEnum := schema["enum"]; !hasEnum {
+				result["enum"] = []any{value}
+			}
 		case "required":
 			if arr, ok := value.([]any); ok && len(arr) == 0 {
 				continue
@@ -201,10 +205,15 @@ func SanitizeJSONSchema(schema map[string]any) map[string]any {
 				}
 			}
 		case "allOf":
+			// allOf means every branch applies simultaneously, so branches
+			// must be MERGED, not overwritten: a flat maps.Copy would let a
+			// later branch's top-level key ("properties", "required", ...)
+			// clobber an earlier branch's, silently dropping tool schema data
+			// (e.g. allOf:[{properties:{a}},{properties:{b}}] losing "a").
 			if arr, ok := value.([]any); ok {
 				for _, item := range arr {
 					if m, ok := item.(map[string]any); ok {
-						maps.Copy(result, SanitizeJSONSchema(m))
+						mergeSchemas(result, SanitizeJSONSchema(m))
 					}
 				}
 			}
@@ -212,6 +221,30 @@ func SanitizeJSONSchema(schema map[string]any) map[string]any {
 	}
 
 	return result
+}
+
+// mergeSchemas deep-merges src into dst for allOf composition. Nested maps
+// merge recursively (properties of both branches survive); arrays append
+// (required lists of both branches survive); any other conflict is resolved
+// in favor of the later branch, matching the previous last-wins behavior.
+func mergeSchemas(dst, src map[string]any) {
+	for k, v := range src {
+		if existing, ok := dst[k]; ok {
+			if em, ok := existing.(map[string]any); ok {
+				if sm, ok := v.(map[string]any); ok {
+					mergeSchemas(em, sm)
+					continue
+				}
+			}
+			if ea, ok := existing.([]any); ok {
+				if sa, ok := v.([]any); ok {
+					dst[k] = append(ea, sa...)
+					continue
+				}
+			}
+		}
+		dst[k] = v
+	}
 }
 
 // EnsureObjectRoot wraps a sanitized schema in an object envelope if its root

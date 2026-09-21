@@ -141,10 +141,10 @@ func buildKiroClient(authMgr *auth.AuthManager, cfg config.Config) kiroclient.Cl
 	clientOpts := []kiroclient.HTTPClientOption{
 		kiroclient.WithTokenCounter(tokencount.CountBytes),
 		kiroclient.WithTokenRefresher(func(ctx context.Context) (string, error) {
-			// Invalidate cache so GetToken re-reads from DB and refreshes
-			// instead of returning the same rejected token.
-			authMgr.InvalidateCache()
-			creds, err := authMgr.GetToken(ctx)
+			// Force a real refresh: the upstream 403 rejected a token that
+			// may still be time-valid locally, so merely re-reading the DB
+			// would serve the same rejected token and burn the retries.
+			creds, err := authMgr.ForceRefresh(ctx)
 			if err != nil {
 				return "", err
 			}

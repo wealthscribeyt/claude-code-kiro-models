@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"maps"
+	"unicode/utf8"
 )
 
 const maxToolNameLen = 64
@@ -34,7 +35,18 @@ func (m *ToolNameMap) Shorten(name string) string {
 		m.toOriginal = make(map[string]string)
 	}
 	h := sha256.Sum256([]byte(name))
-	short := name[:50] + "_" + hex.EncodeToString(h[:])[:13]
+	// Truncate on a rune boundary: a raw 50-byte cut can split a multi-byte
+	// UTF-8 sequence, corrupting the tool name on the wire (JSON turns the
+	// dangling bytes into U+FFFD, and the client echoes the mangled name back
+	// in tool_use blocks).
+	prefix := make([]byte, 0, 50)
+	for _, r := range name {
+		if len(prefix)+utf8.RuneLen(r) > 50 {
+			break
+		}
+		prefix = utf8.AppendRune(prefix, r)
+	}
+	short := string(prefix) + "_" + hex.EncodeToString(h[:])[:13]
 	m.toShort[name] = short
 	m.toOriginal[short] = name
 	return short

@@ -518,3 +518,47 @@ func TestNewAuthManager(t *testing.T) {
 		t.Error("expected error for nonexistent DB, got nil")
 	}
 }
+
+// TestAuthManager_ForceRefresh_BypassesValidCache covers the 403 path: the
+// upstream rejected a token that is still time-valid locally. ForceRefresh
+// must hit the refresh endpoint instead of re-serving the cached token.
+func TestAuthManager_ForceRefresh_BypassesValidCache(t *testing.T) {
+	expiredExpiry := time.Now().Add(-1 * time.Minute).Unix()
+	db := setupTestDBWithCreds(t, "expired-token", "old-refresh", expiredExpiry, "us-east-1")
+	defer func() { _ = db.Close() }()
+
+	callCount := 0
+	srv := newTCP4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.MarshalWrite(w, map[string]any{
+			"accessToken":  "forced-refreshed-token",
+			"refreshToken": "new-refresh",
+			"expiresIn":    28800,
+		})
+		_, _ = w.Write([]byte("\n"))
+	}))
+	defer srv.Close()
+
+	mgr := newAuthManagerWithDB(db)
+	mgr.oidcEndpointFn = func(ssoRegion string) string {
+		return srv.URL + "/token"
+	}
+
+	// Seed a time-valid cached token, as if the upstream 403-rejected it.
+	mgr.cached = &Credentials{
+		AccessToken: "rejected-but-valid-token",
+		ExpiresAt:   time.Now().Add(8 * time.Hour).Unix(),
+	}
+
+	creds, err := mgr.ForceRefresh(context.Background())
+	if err != nil {
+		t.Fatalf("ForceRefresh: %v", err)
+	}
+	if creds.AccessToken != "forced-refreshed-token" {
+		t.Errorf("AccessToken = %q, want %q (cached rejected token was re-served)", creds.AccessToken, "forced-refreshed-token")
+	}
+	if callCount != 1 {
+		t.Errorf("refresh endpoint call count = %d, want 1", callCount)
+	}
+}

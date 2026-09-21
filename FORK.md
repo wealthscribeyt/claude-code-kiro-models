@@ -30,9 +30,9 @@ with maximum quality preservation.
 
 ## Honest ceiling
 
-No proxy is literally 100% — re-encoding costs: token budgets use a
-runes/4 heuristic, stop/max_tokens are enforced adapter-side, plain
-thinking text is not replayed into history. Preserved: native effort
+No proxy is literally 100% — re-encoding costs: token budgets use tiktoken
+cl100k_base (`internal/tokencount`), stop/max_tokens are enforced
+adapter-side, plain thinking text is not replayed into history. Preserved: native effort
 incl. budget mapping, native thinking/redacted streams, 1M routing,
 tool calls incl. full schemas, images (base64), retries.
 
